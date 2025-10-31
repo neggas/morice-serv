@@ -1,35 +1,73 @@
-import express from 'express';
-import { anthropic } from '../server.js';
-import multer from 'multer';
-import fs from 'fs/promises';
-import { v4 as uuidv4 } from 'uuid';
-import { uploadTemporaryFile, deleteFromS3 } from '../services/s3Service.js';
-import { saveAnalysis, getUserAnalyses, getAnalysisById, deleteAnalysis } from '../services/dbService.js';
+import express from "express";
+import { anthropic } from "../server.js";
+import multer from "multer";
+import { v4 as uuidv4 } from "uuid";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+import { uploadTemporaryFile, deleteFromS3 } from "../services/s3Service.js";
+import {
+  saveAnalysis,
+  getUserAnalyses,
+  getAnalysisById,
+  deleteAnalysis,
+} from "../services/dbService.js";
+import * as pdfjsLib from "pdfjs-dist";
 
 const router = express.Router();
 
 // Configuration de Multer avec buffer en mémoire pour S3
-const upload = multer({ 
+const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }
+  limits: { fileSize: 10 * 1024 * 1024 },
 });
+
+// Configuration du worker pour pdfjs-dist
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const workerPath = join(
+  __dirname,
+  "../node_modules/pdfjs-dist/build/pdf.worker.mjs"
+);
+pdfjsLib.GlobalWorkerOptions.workerSrc = workerPath;
+
+// Helper function pour extraire le texte d'un PDF
+async function extractTextFromPDF(buffer) {
+  try {
+    // Convertir le Buffer en Uint8Array
+    const uint8Array = new Uint8Array(buffer);
+    const pdf = await pdfjsLib.getDocument({ data: uint8Array }).promise;
+    let text = "";
+
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const textContent = await page.getTextContent();
+      const pageText = textContent.items.map((item) => item.str).join(" ");
+      text += pageText + "\n";
+    }
+
+    return text;
+  } catch (error) {
+    console.error("Erreur lors de l'extraction du PDF:", error);
+    throw new Error("Impossible d'extraire le texte du PDF: " + error.message);
+  }
+}
 
 /**
  * Analyse un document juridique
  * POST /api/analysis/document
  */
-router.post('/document', upload.single('file'), async (req, res) => {
+router.post("/document", upload.single("file"), async (req, res) => {
   try {
     const file = req.file;
     const { fileName, fileType, userId } = req.body;
 
     if (!file) {
-      return res.status(400).json({ error: 'Aucun fichier fourni' });
+      return res.status(400).json({ error: "Aucun fichier fourni" });
     }
 
     // Créer un ID unique pour cette analyse
     const analysisId = uuidv4();
-    
+
     // Uploader le fichier vers S3 (optionnel, pour sauvegarde)
     let s3Key = null;
     if (process.env.AWS_S3_BUCKET_NAME) {
@@ -40,21 +78,21 @@ router.post('/document', upload.single('file'), async (req, res) => {
           file.mimetype
         );
       } catch (s3Error) {
-        console.warn('Avertissement: Impossible d\'uploader vers S3, continuant sans sauvegarde S3:', s3Error.message);
+        console.warn(
+          "Avertissement: Impossible d'uploader vers S3, continuant sans sauvegarde S3:",
+          s3Error.message
+        );
       }
     }
 
     // Extraire le texte du PDF depuis le buffer
-    let documentText = '';
-    
-    if (file.mimetype === 'application/pdf') {
-      // Import dynamique de pdf-parse
-      const pdfParse = (await import('pdf-parse')).default;
-      const pdfData = await pdfParse(file.buffer);
-      documentText = pdfData.text;
+    let documentText = "";
+
+    if (file.mimetype === "application/pdf") {
+      documentText = await extractTextFromPDF(file.buffer);
     } else {
       // Pour d'autres types de fichiers, lire depuis le buffer
-      documentText = file.buffer.toString('utf8');
+      documentText = file.buffer.toString("utf8");
     }
 
     // Supprimer le fichier temporaire de S3 après extraction
@@ -62,13 +100,16 @@ router.post('/document', upload.single('file'), async (req, res) => {
       try {
         await deleteFromS3(s3Key);
       } catch (deleteError) {
-        console.warn('Avertissement: Impossible de supprimer de S3:', deleteError.message);
+        console.warn(
+          "Avertissement: Impossible de supprimer de S3:",
+          deleteError.message
+        );
       }
     }
 
     if (!documentText || documentText.trim().length < 10) {
-      return res.status(400).json({ 
-        error: 'Le document est vide ou non lisible' 
+      return res.status(400).json({
+        error: "Le document est vide ou non lisible",
       });
     }
 
@@ -361,14 +402,19 @@ Format ta réponse en utilisant du Markdown avec des titres (##) et sous-titres 
 
     // Appel à Claude
     const message = await anthropic.messages.create({
-      model: 'claude-3-haiku-20240307',
+      model: "claude-3-haiku-20240307",
       max_tokens: 4096,
       temperature: 0.2,
       system: systemPrompt,
       messages: [
         {
-          role: 'user',
-          content: `Nom du fichier: ${fileName || file.originalname}\n\nContenu du document:\n\n${documentText.substring(0, 100000)}\n\nFournis une analyse juridique complète, approfondie et structurée de ce document. 
+          role: "user",
+          content: `Nom du fichier: ${
+            fileName || file.originalname
+          }\n\nContenu du document:\n\n${documentText.substring(
+            0,
+            100000
+          )}\n\nFournis une analyse juridique complète, approfondie et structurée de ce document. 
 
 IMPORTANT:
 - Cite systématiquement les articles de loi pertinents (Code civil du Québec, lois spéciales)
@@ -395,9 +441,9 @@ IMPORTANT:
 
 Pour chaque principe, indique clairement: ✅ CONFORME, ⚠️ ATTENTION, ou ❌ NON-CONFORME
 
-L'analyse doit être exhaustive et permettre une compréhension approfondie de la situation juridique, incluant une évaluation complète de l'équité procédurale ET des principes juridiques fondamentaux.`
-        }
-      ]
+L'analyse doit être exhaustive et permettre une compréhension approfondie de la situation juridique, incluant une évaluation complète de l'équité procédurale ET des principes juridiques fondamentaux.`,
+        },
+      ],
     });
 
     const analysis = message.content[0].text;
@@ -408,17 +454,20 @@ L'analyse doit être exhaustive et permettre une compréhension approfondie de l
       try {
         savedAnalysisId = await saveAnalysis({
           analysisId,
-          userId: userId || 'anonymous',
+          userId: userId || "anonymous",
           fileName: fileName || file.originalname,
           fileSize: file.size,
           fileType: file.mimetype,
           wordCount: documentText.split(/\s+/).length,
           analysis,
           analyzedAt: new Date(),
-          status: 'completed',
+          status: "completed",
         });
       } catch (dbError) {
-        console.warn('Avertissement: Impossible de sauvegarder dans MongoDB, continuant sans sauvegarde DB:', dbError.message);
+        console.warn(
+          "Avertissement: Impossible de sauvegarder dans MongoDB, continuant sans sauvegarde DB:",
+          dbError.message
+        );
       }
     }
 
@@ -428,24 +477,23 @@ L'analyse doit être exhaustive et permettre une compréhension approfondie de l
       fileName: fileName || file.originalname,
       fileSize: file.size,
       analyzedAt: new Date().toISOString(),
-      wordCount: documentText.split(/\s+/).length
+      wordCount: documentText.split(/\s+/).length,
     });
-
   } catch (error) {
-    console.error('Erreur Claude (analysis):', error);
-    
+    console.error("Erreur Claude (analysis):", error);
+
     // Nettoyer le fichier de S3 en cas d'erreur si existant
     if (req.file && req.file.s3Key) {
       try {
         await deleteFromS3(req.file.s3Key);
       } catch (deleteError) {
-        console.error('Erreur lors de la suppression de S3:', deleteError);
+        console.error("Erreur lors de la suppression de S3:", deleteError);
       }
     }
 
-    res.status(500).json({ 
-      error: 'Erreur lors de l\'analyse du document',
-      details: error.message 
+    res.status(500).json({
+      error: "Erreur lors de l'analyse du document",
+      details: error.message,
     });
   }
 });
@@ -454,46 +502,49 @@ L'analyse doit être exhaustive et permettre une compréhension approfondie de l
  * Extrait des informations spécifiques d'un texte
  * POST /api/analysis/extract
  */
-router.post('/extract', async (req, res) => {
+router.post("/extract", async (req, res) => {
   try {
     const { text, extractionType } = req.body;
 
     if (!text) {
-      return res.status(400).json({ error: 'Texte manquant' });
+      return res.status(400).json({ error: "Texte manquant" });
     }
 
     const prompts = {
-      parties: 'Extrais uniquement les noms et coordonnées de toutes les parties mentionnées dans ce document.',
-      dates: 'Extrais uniquement toutes les dates importantes mentionnées dans ce document avec leur contexte.',
-      amounts: 'Extrais uniquement tous les montants d\'argent mentionnés dans ce document avec leur contexte.',
-      clauses: 'Extrais et résume uniquement les clauses principales de ce document.'
+      parties:
+        "Extrais uniquement les noms et coordonnées de toutes les parties mentionnées dans ce document.",
+      dates:
+        "Extrais uniquement toutes les dates importantes mentionnées dans ce document avec leur contexte.",
+      amounts:
+        "Extrais uniquement tous les montants d'argent mentionnés dans ce document avec leur contexte.",
+      clauses:
+        "Extrais et résume uniquement les clauses principales de ce document.",
     };
 
-    const userPrompt = prompts[extractionType] || 'Analyse ce texte juridique.';
+    const userPrompt = prompts[extractionType] || "Analyse ce texte juridique.";
 
     const message = await anthropic.messages.create({
-      model: 'claude-3-haiku-20240307',
+      model: "claude-3-haiku-20240307",
       max_tokens: 2048,
       temperature: 0.2,
       messages: [
         {
-          role: 'user',
-          content: `${userPrompt}\n\nTexte:\n${text.substring(0, 50000)}`
-        }
-      ]
+          role: "user",
+          content: `${userPrompt}\n\nTexte:\n${text.substring(0, 50000)}`,
+        },
+      ],
     });
 
     res.json({
       extraction: message.content[0].text,
       type: extractionType,
-      extractedAt: new Date().toISOString()
+      extractedAt: new Date().toISOString(),
     });
-
   } catch (error) {
-    console.error('Erreur Claude (extract):', error);
-    res.status(500).json({ 
-      error: 'Erreur lors de l\'extraction',
-      details: error.message 
+    console.error("Erreur Claude (extract):", error);
+    res.status(500).json({
+      error: "Erreur lors de l'extraction",
+      details: error.message,
     });
   }
 });
@@ -502,78 +553,72 @@ router.post('/extract', async (req, res) => {
  * Analyse plusieurs documents juridiques comme un dossier unique
  * POST /api/analysis/documents/multiple
  */
-router.post('/documents/multiple', upload.array('files', 10), async (req, res) => {
-  try {
-    const files = req.files;
+router.post(
+  "/documents/multiple",
+  upload.array("files", 10),
+  async (req, res) => {
+    try {
+      const files = req.files;
 
-    if (!files || files.length === 0) {
-      return res.status(400).json({ error: 'Aucun fichier fourni' });
-    }
+      if (!files || files.length === 0) {
+        return res.status(400).json({ error: "Aucun fichier fourni" });
+      }
 
-    if (files.length > 10) {
-      return res.status(400).json({ error: 'Maximum 10 fichiers autorisés' });
-    }
+      if (files.length > 10) {
+        return res.status(400).json({ error: "Maximum 10 fichiers autorisés" });
+      }
 
-    console.log(`Analyse d'un dossier de ${files.length} documents...`);
+      console.log(`Analyse d'un dossier de ${files.length} documents...`);
 
-    // Extraire le texte de tous les documents et les combiner
-    let combinedText = '';
-    const filesList = [];
-    let totalWords = 0;
-    
-    for (const file of files) {
-      try {
-        // Extraire le texte du document
-        let documentText = '';
-        
-        if (file.mimetype === 'application/pdf') {
-          const pdfParse = (await import('pdf-parse')).default;
-          const dataBuffer = await fs.readFile(file.path);
-          const pdfData = await pdfParse(dataBuffer);
-          documentText = pdfData.text;
-        } else {
-          documentText = await fs.readFile(file.path, 'utf8');
-        }
+      // Extraire le texte de tous les documents et les combiner
+      let combinedText = "";
+      const filesList = [];
+      let totalWords = 0;
 
-        // Supprimer le fichier après lecture
-        await fs.unlink(file.path);
-
-        if (documentText && documentText.trim().length >= 10) {
-          // Ajouter ce document au texte combiné avec un séparateur
-          combinedText += `\n\n${'='.repeat(80)}\n`;
-          combinedText += `DOCUMENT: ${file.originalname}\n`;
-          combinedText += `${'='.repeat(80)}\n\n`;
-          combinedText += documentText;
-          
-          filesList.push({
-            name: file.originalname,
-            size: file.size,
-            wordCount: documentText.split(/\s+/).length
-          });
-          
-          totalWords += documentText.split(/\s+/).length;
-        } else {
-          console.log(`⚠️ Document ignoré (trop court): ${file.originalname}`);
-        }
-      } catch (fileError) {
-        console.error(`Erreur pour ${file.originalname}:`, fileError);
-        // Nettoyer le fichier en cas d'erreur
+      for (const file of files) {
         try {
-          await fs.unlink(file.path);
-        } catch (unlinkError) {
-          console.error('Erreur lors de la suppression:', unlinkError);
+          // Extraire le texte du document
+          let documentText = "";
+
+          if (file.mimetype === "application/pdf") {
+            documentText = await extractTextFromPDF(file.buffer);
+          } else {
+            documentText = file.buffer.toString("utf8");
+          }
+
+          if (documentText && documentText.trim().length >= 10) {
+            // Ajouter ce document au texte combiné avec un séparateur
+            combinedText += `\n\n${"=".repeat(80)}\n`;
+            combinedText += `DOCUMENT: ${file.originalname}\n`;
+            combinedText += `${"=".repeat(80)}\n\n`;
+            combinedText += documentText;
+
+            filesList.push({
+              name: file.originalname,
+              size: file.size,
+              wordCount: documentText.split(/\s+/).length,
+            });
+
+            totalWords += documentText.split(/\s+/).length;
+          } else {
+            console.log(
+              `⚠️ Document ignoré (trop court): ${file.originalname}`
+            );
+          }
+        } catch (fileError) {
+          console.error(`Erreur pour ${file.originalname}:`, fileError);
+          // Pas besoin de nettoyer le fichier car il est stocké en mémoire
         }
       }
-    }
 
-    if (!combinedText || combinedText.trim().length < 10) {
-      return res.status(400).json({ 
-        error: 'Le dossier ne contient aucun texte lisible' 
-      });
-    }
+      if (!combinedText || combinedText.trim().length < 10) {
+        return res.status(400).json({
+          error: "Le dossier ne contient aucun texte lisible",
+        });
+      }
 
-    // Prompt système pour l'analyse d'un dossier complet
-    const systemPrompt = `Tu es un assistant juridique expert spécialisé dans l'analyse de dossiers juridiques canadiens, avec une expertise approfondie du droit québécois et canadien.
+      // Prompt système pour l'analyse d'un dossier complet
+      const systemPrompt = `Tu es un assistant juridique expert spécialisé dans l'analyse de dossiers juridiques canadiens, avec une expertise approfondie du droit québécois et canadien.
 
 Ton rôle est d'analyser l'ENSEMBLE des documents fournis comme un DOSSIER UNIQUE et de produire une analyse globale cohérente qui prend en compte tous les documents et leurs interrelations.
 
@@ -859,19 +904,21 @@ Tu dois fournir une ÉTUDE DE CAS complète et détaillée comprenant:
 
 Format ta réponse en utilisant du Markdown avec des titres (##) et sous-titres (###) clairs. Utilise le gras (**texte**) pour les éléments importants et cite précisément les articles de loi pertinents.`;
 
-    // Préparer la liste des documents
-    const documentsListText = filesList.map((f, idx) => `${idx + 1}. ${f.name} (${f.wordCount} mots)`).join('\n');
+      // Préparer la liste des documents
+      const documentsListText = filesList
+        .map((f, idx) => `${idx + 1}. ${f.name} (${f.wordCount} mots)`)
+        .join("\n");
 
-    // Appel à Claude pour l'analyse du dossier complet
-    const message = await anthropic.messages.create({
-      model: 'claude-3-haiku-20240307',
-      max_tokens: 4096,
-      temperature: 0.2,
-      system: systemPrompt,
-      messages: [
-        {
-          role: 'user',
-          content: `DOSSIER JURIDIQUE À ANALYSER
+      // Appel à Claude pour l'analyse du dossier complet
+      const message = await anthropic.messages.create({
+        model: "claude-3-haiku-20240307",
+        max_tokens: 4096,
+        temperature: 0.2,
+        system: systemPrompt,
+        messages: [
+          {
+            role: "user",
+            content: `DOSSIER JURIDIQUE À ANALYSER
 
 Ce dossier contient ${filesList.length} document(s):
 ${documentsListText}
@@ -913,73 +960,64 @@ INSTRUCTIONS:
 
 Pour chaque principe, indique clairement: ✅ CONFORME, ⚠️ ATTENTION, ou ❌ NON-CONFORME
 
-L'analyse doit être exhaustive et permettre une compréhension approfondie de la situation juridique globale du dossier, incluant une évaluation complète de l'équité procédurale ET des principes juridiques fondamentaux à travers tous les documents.`
-        }
-      ]
-    });
+L'analyse doit être exhaustive et permettre une compréhension approfondie de la situation juridique globale du dossier, incluant une évaluation complète de l'équité procédurale ET des principes juridiques fondamentaux à travers tous les documents.`,
+          },
+        ],
+      });
 
-    const analysis = message.content[0].text;
+      const analysis = message.content[0].text;
 
-    console.log(`✓ Dossier analysé avec succès (${filesList.length} documents)`);
+      console.log(
+        `✓ Dossier analysé avec succès (${filesList.length} documents)`
+      );
 
-    // Retourner le résultat unique
-    res.json({
-      analysis: analysis,
-      fileName: `Dossier-${filesList.length}-documents`,
-      fileSize: filesList.reduce((sum, f) => sum + f.size, 0),
-      analyzedAt: new Date().toISOString(),
-      wordCount: totalWords,
-      documentsCount: filesList.length,
-      documents: filesList
-    });
+      // Retourner le résultat unique
+      res.json({
+        analysis: analysis,
+        fileName: `Dossier-${filesList.length}-documents`,
+        fileSize: filesList.reduce((sum, f) => sum + f.size, 0),
+        analyzedAt: new Date().toISOString(),
+        wordCount: totalWords,
+        documentsCount: filesList.length,
+        documents: filesList,
+      });
+    } catch (error) {
+      console.error("Erreur Claude (multiple analysis):", error);
 
-  } catch (error) {
-    console.error('Erreur Claude (multiple analysis):', error);
-    
-    // Nettoyer tous les fichiers en cas d'erreur
-    if (req.files) {
-      for (const file of req.files) {
-        try {
-          await fs.unlink(file.path);
-        } catch (unlinkError) {
-          console.error('Erreur lors de la suppression du fichier:', unlinkError);
-        }
-      }
+      res.status(500).json({
+        error: "Erreur lors de l'analyse des documents",
+        details: error.message,
+      });
     }
-
-    res.status(500).json({ 
-      error: 'Erreur lors de l\'analyse des documents',
-      details: error.message 
-    });
   }
-});
+);
 
 /**
  * Récupère toutes les analyses d'un utilisateur
  * GET /api/analysis/user/:userId
  */
-router.get('/user/:userId', async (req, res) => {
+router.get("/user/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
-    
+
     if (!process.env.MONGODB_URI) {
       return res.status(503).json({
-        error: 'MongoDB non configuré'
+        error: "MongoDB non configuré",
       });
     }
-    
+
     const analyses = await getUserAnalyses(userId);
-    
+
     res.json({
       success: true,
       count: analyses.length,
-      analyses: analyses
+      analyses: analyses,
     });
   } catch (error) {
-    console.error('Erreur getUserAnalyses:', error);
+    console.error("Erreur getUserAnalyses:", error);
     res.status(500).json({
-      error: 'Erreur lors de la récupération des analyses',
-      details: error.message
+      error: "Erreur lors de la récupération des analyses",
+      details: error.message,
     });
   }
 });
@@ -988,33 +1026,33 @@ router.get('/user/:userId', async (req, res) => {
  * Récupère une analyse spécifique par ID
  * GET /api/analysis/:analysisId
  */
-router.get('/:analysisId', async (req, res) => {
+router.get("/:analysisId", async (req, res) => {
   try {
     const { analysisId } = req.params;
-    
+
     if (!process.env.MONGODB_URI) {
       return res.status(503).json({
-        error: 'MongoDB non configuré'
+        error: "MongoDB non configuré",
       });
     }
-    
+
     const analysis = await getAnalysisById(analysisId);
-    
+
     if (!analysis) {
       return res.status(404).json({
-        error: 'Analyse non trouvée'
+        error: "Analyse non trouvée",
       });
     }
-    
+
     res.json({
       success: true,
-      analysis: analysis
+      analysis: analysis,
     });
   } catch (error) {
-    console.error('Erreur getAnalysis:', error);
+    console.error("Erreur getAnalysis:", error);
     res.status(500).json({
-      error: 'Erreur lors de la récupération de l\'analyse',
-      details: error.message
+      error: "Erreur lors de la récupération de l'analyse",
+      details: error.message,
     });
   }
 });
@@ -1023,36 +1061,35 @@ router.get('/:analysisId', async (req, res) => {
  * Supprime une analyse
  * DELETE /api/analysis/:analysisId
  */
-router.delete('/:analysisId', async (req, res) => {
+router.delete("/:analysisId", async (req, res) => {
   try {
     const { analysisId } = req.params;
-    
+
     if (!process.env.MONGODB_URI) {
       return res.status(503).json({
-        error: 'MongoDB non configuré'
+        error: "MongoDB non configuré",
       });
     }
-    
+
     const deleted = await deleteAnalysis(analysisId);
-    
+
     if (!deleted) {
       return res.status(404).json({
-        error: 'Analyse non trouvée'
+        error: "Analyse non trouvée",
       });
     }
-    
+
     res.json({
       success: true,
-      message: 'Analyse supprimée avec succès'
+      message: "Analyse supprimée avec succès",
     });
   } catch (error) {
-    console.error('Erreur deleteAnalysis:', error);
+    console.error("Erreur deleteAnalysis:", error);
     res.status(500).json({
-      error: 'Erreur lors de la suppression de l\'analyse',
-      details: error.message
+      error: "Erreur lors de la suppression de l'analyse",
+      details: error.message,
     });
   }
 });
 
 export default router;
-
